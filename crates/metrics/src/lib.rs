@@ -15,6 +15,7 @@ pub struct PublisherMetrics {
     pub xt_decided_abort_total: Counter<u64>,
     pub xt_queued_total: Counter<u64>,
     pub xt_decision_latency_seconds: Histogram,
+    pub xt_finalised_per_period: Gauge,
     pub period_broadcast_total: Counter<u64>,
 }
 
@@ -69,6 +70,13 @@ impl PublisherMetrics {
             xt_queued_total.clone(),
         );
 
+        let xt_finalised_per_period = Gauge::default();
+        registry.register(
+            "publisher_xt_finalized_per_period",
+            "Cross-chain transactions finalized in the last period (L1-confirmed)",
+            xt_finalised_per_period.clone(),
+        );
+
         let xt_decision_latency_seconds =
             Histogram::new([0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0].into_iter());
         registry.register(
@@ -93,6 +101,7 @@ impl PublisherMetrics {
             xt_decided_abort_total,
             xt_queued_total,
             xt_decision_latency_seconds,
+            xt_finalised_per_period,
             period_broadcast_total,
         }
     }
