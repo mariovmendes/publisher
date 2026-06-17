@@ -53,7 +53,6 @@ pub(crate) struct CoordinatorState {
     pub last_finalized_superblock_number: u64,
     pub last_finalized_superblock_hash: Vec<u8>,
     pub current_period_committed_xts: u64,
-    pub pending_xt_count: u64,
     /// TODO: Replace with per-superblock-number keyed collection once op-succinct
     /// sends the publisher's global superblock number instead of chain-local `end_block`.
     /// Currently collects the latest proof from each chain regardless of `superblock_number`.
@@ -75,7 +74,6 @@ impl CoordinatorState {
             last_finalized_superblock_number: 0,
             last_finalized_superblock_hash: Vec::new(),
             current_period_committed_xts: 0,
-            pending_xt_count: 0,
             pending_proofs: HashMap::new(),
             proof_collection_started: None,
         }
@@ -258,7 +256,6 @@ impl CoordinatorState {
         if let Some(started) = self.proof_collection_started {
             if Instant::now().duration_since(started) >= proof_window {
                 self.pending_proofs.clear();
-                self.pending_xt_count = 0;
                 self.current_period_committed_xts = 0;
                 self.proof_collection_started = None;
                 return true;
@@ -380,7 +377,9 @@ impl Coordinator {
             let pid = PeriodId(state.current_period_id.get() + 1);
             state.current_period_id = pid;
             state.next_sequence_num = SequenceNumber(1);
-            state.pending_xt_count += state.current_period_committed_xts;
+            if let Some(m) = &self.metrics {
+                m.xt_finalised_per_period.set(state.current_period_committed_xts as i64);
+            }
             state.current_period_committed_xts = 0;
             let sb = state.next_superblock_number;
             (pid, sb)
@@ -684,7 +683,6 @@ impl Coordinator {
             }
 
             if let Some(submitter) = self.l1_submitter.clone() {
-                let metrics = self.metrics.clone();
                 let state = self.state.clone();
                 tokio::spawn(async move {
                     match submitter.submit(submit_sb_number, &proofs).await {
@@ -692,12 +690,6 @@ impl Coordinator {
                             let mut s = state.write().await;
                             s.last_finalized_superblock_number = submit_sb_number;
                             s.next_superblock_number = SuperblockNumber::new(submit_sb_number + 1);
-
-                            if let Some(m) = &metrics {
-                                m.xt_finalised_per_period.set(s.pending_xt_count as i64);
-                            }
-                            s.pending_xt_count = 0;
-
                             info!(
                                 superblock_number = submit_sb_number,
                                 "L1 submission succeeded, advancing state"
