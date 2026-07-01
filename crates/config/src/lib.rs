@@ -26,6 +26,13 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub log: LogConfig,
     pub settlement: SettlementConfig,
+    /// When true, this publisher is running against sidecars/verifier that
+    /// only ever produce fabricated proofs (see `MOCK_MODE` in sidecar and
+    /// the `MockVerifier` contract deployed on L1). Purely informational on
+    /// the publisher side today — it never validates proofs itself either
+    /// way — but surfaced in logs so it's obvious real ZK proofs aren't
+    /// involved.
+    pub mock_mode: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -167,6 +174,8 @@ impl Config {
         env_str("SETTLEMENT_L1_RPC_URL", &mut self.settlement.l1_rpc_url);
         env_str("SETTLEMENT_L2OO_ADDRESS", &mut self.settlement.l2oo_address);
         env_str("SETTLEMENT_PROPOSER_KEY", &mut self.settlement.proposer_key);
+
+        env_bool("MOCK_MODE", &mut self.mock_mode);
     }
 
     fn validate(&self) -> Result<()> {
