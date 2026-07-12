@@ -29,6 +29,12 @@ async fn main() -> Result<()> {
 
     publisher_tracing::init(&cfg.log.level, cfg.log.pretty);
     info!("Starting Ethera Shared Publisher");
+    if cfg.mock_mode {
+        warn!(
+            "MOCK_MODE enabled — expecting fabricated proofs from sidecars \
+             and a MockVerifier on L1; no real ZK proof is ever checked"
+        );
+    }
 
     let mut registry = Registry::default();
     let metrics = if cfg.metrics.enabled {
