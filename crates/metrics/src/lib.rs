@@ -16,6 +16,7 @@ pub struct PublisherMetrics {
     pub xt_queued_total: Counter<u64>,
     pub xt_decision_latency_seconds: Histogram,
     pub xt_finalised_per_period: Gauge,
+    pub xt_block_inclusion_latency_seconds: Histogram,
     pub period_broadcast_total: Counter<u64>,
 }
 
@@ -85,6 +86,14 @@ impl PublisherMetrics {
             xt_decision_latency_seconds.clone(),
         );
 
+        let xt_block_inclusion_latency_seconds =
+            Histogram::new([1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5, 4.75, 5.0].into_iter());
+        registry.register(
+            "publisher_xt_block_inclusion_latency_seconds",
+            "Time from XT submission to all chains confirming block inclusion",
+            xt_block_inclusion_latency_seconds.clone(),
+        );
+
         let period_broadcast_total = Counter::default();
         registry.register(
             "publisher_period_broadcast",
@@ -102,6 +111,7 @@ impl PublisherMetrics {
             xt_queued_total,
             xt_decision_latency_seconds,
             xt_finalised_per_period,
+            xt_block_inclusion_latency_seconds,
             period_broadcast_total,
         }
     }

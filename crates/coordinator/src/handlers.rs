@@ -52,6 +52,11 @@ pub async fn dispatch(coordinator: Arc<Coordinator>, client_id: String, data: Ve
         Payload::Proof(proof) => {
             handle_proof(coordinator, &client_id, proof).await;
         }
+        Payload::Confirmed(confirmed) => {
+            coordinator.
+                handle_confirmed(&confirmed.instance_id, ChainId::new(confirmed.chain_id))
+                .await;
+        }
         other => {
             warn!(client_id, payload_type = ?std::mem::discriminant(&other), "Unhandled payload");
         }

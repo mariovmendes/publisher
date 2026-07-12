@@ -1,6 +1,6 @@
 //! Core coordinator state and public API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,14 +21,25 @@ const MAX_PENDING_QUEUE_SIZE: usize = 100;
 
 #[derive(Debug)]
 pub(crate) struct ActiveXt {
+    received_at: Instant,
     chains: Vec<ChainId>,
     votes: HashMap<ChainId, bool>,
     instance_id_bytes: Vec<u8>,
     start_time: Instant,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingConfirmation {
+    received_at: Instant,
+    chains: Vec<ChainId>,
+    confirmed_chains: HashSet<ChainId>,
+    #[allow(dead_code)]
+    instance_id_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingEntry {
+    received_at: Instant,
     pub xt_request: compose_spec_proto::XtRequest,
     pub chains: Vec<ChainId>,
 }
@@ -58,6 +69,7 @@ pub(crate) struct CoordinatorState {
     /// Currently collects the latest proof from each chain regardless of `superblock_number`.
     pending_proofs: HashMap<u64, ChainProof>,
     proof_collection_started: Option<Instant>,
+    pending_confirmations: HashMap<String, PendingConfirmation>,
 }
 
 impl CoordinatorState {
@@ -76,6 +88,7 @@ impl CoordinatorState {
             current_period_committed_xts: 0,
             pending_proofs: HashMap::new(),
             proof_collection_started: None,
+            pending_confirmations: HashMap::new(),
         }
     }
 
@@ -119,6 +132,7 @@ impl CoordinatorState {
         &mut self,
         xt_req: &compose_spec_proto::XtRequest,
         chains: &[ChainId],
+        received_at: Instant
     ) -> (String, Vec<u8>) {
         let compose_req = proto_to_spec_xt(xt_req);
         let seq_num = self.next_sequence_num;
@@ -131,6 +145,7 @@ impl CoordinatorState {
         self.active_xts.insert(
             xt_id.clone(),
             ActiveXt {
+                received_at,
                 chains: chains.to_vec(),
                 votes: HashMap::new(),
                 instance_id_bytes: instance_id.as_bytes().to_vec(),
@@ -201,6 +216,17 @@ impl CoordinatorState {
             .unwrap_or(0.0);
 
         self.release_chains(xt_id);
+
+        // Move tracking data before removal
+        if let Some(xt) = self.active_xts.get(xt_id) {
+            self.pending_confirmations.insert(xt_id.to_string(), PendingConfirmation {
+                received_at: xt.received_at,  // placeholder until received_at is added
+                chains: xt.chains.clone(),
+                confirmed_chains: HashSet::new(),
+                instance_id_bytes: xt.instance_id_bytes.clone(),
+            });
+        }
+
         self.active_xts.remove(xt_id);
 
         let msg = compose_spec_proto::Message {
@@ -214,6 +240,28 @@ impl CoordinatorState {
         };
 
         Some((decision, latency, msg.encode_to_vec()))
+    }
+
+    fn handle_confirmed(&mut self, xt_id: &str, chain_id: ChainId) -> Option<f64> {
+        let pc = self.pending_confirmations.get_mut(xt_id)?;
+
+        if !pc.chains.contains(&chain_id) {
+            warn!(xt_id, chain_id = %chain_id, "Confirmed from non-participant chain");
+            return None;
+        }
+
+        if !pc.confirmed_chains.insert(chain_id) {
+            return None;
+        }
+
+        if pc.confirmed_chains.len() == pc.chains.len() {
+            let latency = pc.received_at.elapsed().as_secs_f64();
+            self.pending_confirmations.remove(xt_id);
+            Some(latency)
+        } else {
+            info!(xt_id, chain_id = %chain_id, "Confirmed from participant chain");
+            None
+        }
     }
 
     /// Finds timed-out xTs and produces `Decided(false)` messages for each.
@@ -420,6 +468,8 @@ impl Coordinator {
             return;
         }
 
+        let received_at = Instant::now();
+
         let broadcast = {
             let mut state = self.state.write().await;
 
@@ -429,6 +479,7 @@ impl Coordinator {
                     return;
                 }
                 state.pending_queue.push(PendingEntry {
+                    received_at,
                     xt_request: xt_req,
                     chains,
                 });
@@ -437,7 +488,7 @@ impl Coordinator {
                 }
                 None
             } else {
-                Some(state.prepare_xt(&xt_req, &chains))
+                Some(state.prepare_xt(&xt_req, &chains, received_at))
             }
         };
 
@@ -537,7 +588,7 @@ impl Coordinator {
                 let Some(entry) = state.take_next_ready() else {
                     return;
                 };
-                Some(state.prepare_xt(&entry.xt_request, &entry.chains))
+                Some(state.prepare_xt(&entry.xt_request, &entry.chains, entry.received_at))
             };
 
             if let Some((_xt_id, data)) = broadcast {
@@ -610,6 +661,21 @@ impl Coordinator {
             self.inc_broadcasts();
             if let Err(e) = self.server.broadcast_raw(&data, "").await {
                 error!(error = %e, "Failed to broadcast rollback");
+            }
+        }
+    }
+
+    pub async fn handle_confirmed(&self, instance_id: &[u8], chain_id: ChainId) {
+        let xt_id = hex::encode(instance_id);
+        let latency = {
+            let mut state = self.state.write().await;
+            state.handle_confirmed(&xt_id, chain_id)
+        };
+
+        if let Some(latency) = latency {
+            info!(xt_id, latency_ms = (latency * 1000.0) as u64, "All chains confirmed block inclusion");
+            if let Some(m) = &self.metrics {
+                m.xt_block_inclusion_latency_seconds.observe(latency);
             }
         }
     }
