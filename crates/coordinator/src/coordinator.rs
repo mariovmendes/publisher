@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use publisher_metrics::PublisherMetrics;
 use publisher_transport::server::QuicServer;
 
-const MAX_PENDING_QUEUE_SIZE: usize = 100;
+const MAX_ACTIVE_XTS: usize = 100;
 
 #[derive(Debug)]
 pub(crate) struct ActiveXt {
@@ -38,13 +38,6 @@ pub(crate) struct PendingConfirmation {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingEntry {
-    received_at: Instant,
-    pub xt_request: compose_spec_proto::XtRequest,
-    pub chains: Vec<ChainId>,
-}
-
-#[derive(Debug, Clone)]
 struct ChainProof {
     #[allow(dead_code)]
     superblock_number: u64,
@@ -56,8 +49,6 @@ pub(crate) struct CoordinatorState {
     pub chain_to_client: HashMap<ChainId, String>,
     pub client_to_chain: HashMap<String, ChainId>,
     pub active_xts: HashMap<String, ActiveXt>,
-    pub active_chains: HashMap<ChainId, String>,
-    pub pending_queue: Vec<PendingEntry>,
     pub current_period_id: PeriodId,
     pub next_sequence_num: SequenceNumber,
     pub next_superblock_number: SuperblockNumber,
@@ -78,8 +69,6 @@ impl CoordinatorState {
             chain_to_client: HashMap::new(),
             client_to_chain: HashMap::new(),
             active_xts: HashMap::new(),
-            active_chains: HashMap::new(),
-            pending_queue: Vec::new(),
             current_period_id: PeriodId(0),
             next_sequence_num: SequenceNumber(1),
             next_superblock_number: SuperblockNumber::new(1),
@@ -98,26 +87,6 @@ impl CoordinatorState {
         }
         self.chain_to_client.insert(chain_id, client_id.to_string());
         self.client_to_chain.insert(client_id.to_string(), chain_id);
-    }
-
-    fn has_overlap(&self, chains: &[ChainId]) -> bool {
-        chains.iter().any(|c| self.active_chains.contains_key(c))
-    }
-
-    fn reserve_chains(&mut self, xt_id: &str, chains: &[ChainId]) {
-        for &chain_id in chains {
-            self.active_chains.insert(chain_id, xt_id.to_string());
-        }
-    }
-
-    fn release_chains(&mut self, xt_id: &str) {
-        if let Some(xt) = self.active_xts.get(xt_id) {
-            for chain_id in &xt.chains {
-                if self.active_chains.get(chain_id).map(String::as_str) == Some(xt_id) {
-                    self.active_chains.remove(chain_id);
-                }
-            }
-        }
     }
 
     fn check_decision(&self, xt_id: &str) -> Option<bool> {
@@ -141,7 +110,6 @@ impl CoordinatorState {
         let xt_id = instance_id.to_string();
         self.next_sequence_num = SequenceNumber(seq_num.get() + 1);
 
-        self.reserve_chains(&xt_id, chains);
         self.active_xts.insert(
             xt_id.clone(),
             ActiveXt {
@@ -215,8 +183,6 @@ impl CoordinatorState {
             .map(|x| x.start_time.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
-        self.release_chains(xt_id);
-
         // Move tracking data before removal
         if let Some(xt) = self.active_xts.get(xt_id) {
             self.pending_confirmations.insert(xt_id.to_string(), PendingConfirmation {
@@ -282,7 +248,6 @@ impl CoordinatorState {
                 .map(|xt| xt.instance_id_bytes.clone())
                 .unwrap_or_default();
 
-            self.release_chains(&xt_id);
             self.active_xts.remove(&xt_id);
 
             let msg = compose_spec_proto::Message {
@@ -310,14 +275,6 @@ impl CoordinatorState {
             }
         }
         false
-    }
-
-    fn take_next_ready(&mut self) -> Option<PendingEntry> {
-        let idx = self
-            .pending_queue
-            .iter()
-            .position(|e| !self.has_overlap(&e.chains))?;
-        Some(self.pending_queue.remove(idx))
     }
 
     fn is_chain_registered(&self, chain_id: ChainId) -> bool {
@@ -473,23 +430,12 @@ impl Coordinator {
         let broadcast = {
             let mut state = self.state.write().await;
 
-            if state.has_overlap(&chains) {
-                if state.pending_queue.len() >= MAX_PENDING_QUEUE_SIZE {
-                    warn!(client_id, "XT queue full, rejecting");
-                    return;
-                }
-                state.pending_queue.push(PendingEntry {
-                    received_at,
-                    xt_request: xt_req,
-                    chains,
-                });
-                if let Some(m) = &self.metrics {
-                    m.xt_queued_total.inc();
-                }
-                None
-            } else {
-                Some(state.prepare_xt(&xt_req, &chains, received_at))
+            if state.active_xts.len() >= MAX_ACTIVE_XTS {
+                warn!(client_id, "Active XT limit reached, rejecting new transaction");
+                return;
             }
+
+            Some(state.prepare_xt(&xt_req, &chains, received_at))
         };
 
         if let Some((_xt_id, data)) = broadcast {
@@ -538,8 +484,6 @@ impl Coordinator {
             if let Err(e) = self.server.broadcast_raw(&data, "").await {
                 error!(xt_id, error = %e, "Failed to broadcast decision");
             }
-
-            self.drain_queue().await;
         }
     }
 
@@ -581,28 +525,6 @@ impl Coordinator {
         }
     }
 
-    async fn drain_queue(&self) {
-        loop {
-            let broadcast = {
-                let mut state = self.state.write().await;
-                let Some(entry) = state.take_next_ready() else {
-                    return;
-                };
-                Some(state.prepare_xt(&entry.xt_request, &entry.chains, entry.received_at))
-            };
-
-            if let Some((_xt_id, data)) = broadcast {
-                self.inc_broadcasts();
-                if let Some(m) = &self.metrics {
-                    m.xt_started_total.inc();
-                }
-                if let Err(e) = self.server.broadcast_raw(&data, "").await {
-                    error!(error = %e, "Failed to broadcast queued XT");
-                }
-            }
-        }
-    }
-
     pub async fn reap_timed_out_xts(&self) {
         let timed_out = {
             let mut state = self.state.write().await;
@@ -618,10 +540,6 @@ impl Coordinator {
             if let Err(e) = self.server.broadcast_raw(data, "").await {
                 error!(xt_id, error = %e, "Failed to broadcast timeout decision");
             }
-        }
-
-        if !timed_out.is_empty() {
-            self.drain_queue().await;
         }
     }
 
@@ -781,8 +699,6 @@ impl Coordinator {
             "active_connections": self.server.connection_count().await,
             "registered_chains": state.chain_to_client.len(),
             "active_2pc_transactions": state.active_xts.len(),
-            "active_chains": state.active_chains.len(),
-            "queued_xts": state.pending_queue.len(),
             "pending_proof_superblocks": state.pending_proofs.len(),
             "current_period_id": state.current_period_id.get(),
             "next_superblock_number": state.next_superblock_number.get(),

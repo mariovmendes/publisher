@@ -13,7 +13,6 @@ pub struct PublisherMetrics {
     pub xt_started_total: Counter<u64>,
     pub xt_decided_commit_total: Counter<u64>,
     pub xt_decided_abort_total: Counter<u64>,
-    pub xt_queued_total: Counter<u64>,
     pub xt_decision_latency_seconds: Histogram,
     pub xt_finalised_per_period: Gauge,
     pub xt_block_inclusion_latency_seconds: Histogram,
@@ -64,13 +63,6 @@ impl PublisherMetrics {
             xt_decided_abort_total.clone(),
         );
 
-        let xt_queued_total = Counter::default();
-        registry.register(
-            "publisher_xt_queued",
-            "Cross-chain transactions queued due to chain overlap",
-            xt_queued_total.clone(),
-        );
-
         let xt_finalised_per_period = Gauge::default();
         registry.register(
             "publisher_xt_finalized_per_period",
@@ -108,7 +100,6 @@ impl PublisherMetrics {
             xt_started_total,
             xt_decided_commit_total,
             xt_decided_abort_total,
-            xt_queued_total,
             xt_decision_latency_seconds,
             xt_finalised_per_period,
             xt_block_inclusion_latency_seconds,

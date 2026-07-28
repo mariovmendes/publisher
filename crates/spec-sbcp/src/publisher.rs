@@ -15,12 +15,8 @@ use crate::id::generate_instance_id;
 /// Errors returned by [`Publisher`] operations.
 #[derive(Debug, Error)]
 pub enum PublisherError {
-    #[error("can not start any instance")]
-    CannotStartInstance,
     #[error("can not start period: target superblock is {target}, expected {expected}")]
     CannotStartPeriod { target: u64, expected: u64 },
-    #[error("chain not active")]
-    ChainNotActive,
     #[error("can not advance to older settled state")]
     OldSettledState,
     #[error("invalid request")]
@@ -68,7 +64,6 @@ struct PublisherState {
     proofs: HashMap<SuperblockNumber, HashMap<ChainId, Vec<u8>>>,
     chains: HashSet<ChainId>,
     sequence_number: SequenceNumber,
-    active_chains: HashMap<ChainId, bool>,
     proof_window: u64,
 }
 
@@ -116,7 +111,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
                 proofs: HashMap::new(),
                 chains,
                 sequence_number: SequenceNumber(0),
-                active_chains: HashMap::new(),
                 proof_window,
             }),
             prover,
@@ -280,10 +274,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
 
         let chains = chains_from_request(&request);
 
-        if Self::any_chain_already_active(&state.active_chains, &chains) {
-            return Err(PublisherError::CannotStartInstance);
-        }
-
         state.sequence_number = state.sequence_number + 1;
         let instance = Instance {
             id: generate_instance_id(state.period_id, state.sequence_number, &request),
@@ -291,10 +281,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
             sequence_number: state.sequence_number,
             xt_request: request,
         };
-
-        for &chain_id in &chains {
-            state.active_chains.insert(chain_id, true);
-        }
 
         info!(
             instance_id = %instance.id,
@@ -304,25 +290,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
         );
 
         Ok(instance)
-    }
-
-    /// Removes the decided instance's chains from active.
-    pub fn decide_instance(&self, instance: &Instance) -> Result<(), PublisherError> {
-        let mut state = self.inner.lock().unwrap();
-        let chains = instance.chains();
-
-        for &chain_id in &chains {
-            if !state.active_chains.contains_key(&chain_id) {
-                return Err(PublisherError::ChainNotActive);
-            }
-        }
-
-        for &chain_id in &chains {
-            state.active_chains.remove(&chain_id);
-        }
-
-        info!(instance_id = %instance.id, "Decided instance, removing active chains");
-        Ok(())
     }
 
     /// Advances the settled state when L1 emits a new settled event.
@@ -355,7 +322,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
 
     fn rollback(&self) {
         let mut state = self.inner.lock().unwrap();
-        state.active_chains.clear();
         state.sequence_number = SequenceNumber(0);
         state.target_superblock_number = state.last_finalized_superblock_number + 1;
         self.messenger.broadcast_rollback(
@@ -364,15 +330,6 @@ impl<P: PublisherProver, M: PublisherMessenger, L: L1Publisher> Publisher<P, M, 
             state.last_finalized_superblock_hash,
         );
         state.proofs.clear();
-    }
-
-    fn any_chain_already_active(
-        active_chains: &HashMap<ChainId, bool>,
-        chains: &[ChainId],
-    ) -> bool {
-        chains
-            .iter()
-            .any(|c| active_chains.get(c).copied().unwrap_or(false))
     }
 
     /// Access the internal target superblock number (for testing).
@@ -596,24 +553,28 @@ mod tests {
     }
 
     #[test]
-    fn start_instance_conflicting_set_rejected() {
+    fn start_instance_overlapping_sets_allowed() {
         let (pub_inst, _, _, _) =
             new_publisher_for_test(5, 5, 5, SuperblockHash([1; 32]), 0, default_chain_set());
 
-        pub_inst
+        let inst1 = pub_inst
             .start_instance(make_xt_request(vec![
                 chain_req(1, &[b"a"]),
                 chain_req(2, &[b"b"]),
             ]))
             .unwrap();
 
-        let err = pub_inst
+        // Overlapping {2,3} starts concurrently instead of being rejected.
+        let inst2 = pub_inst
             .start_instance(make_xt_request(vec![
                 chain_req(2, &[b"x"]),
                 chain_req(3, &[b"y"]),
             ]))
-            .unwrap_err();
-        assert!(matches!(err, PublisherError::CannotStartInstance));
+            .unwrap();
+
+        assert_ne!(inst1.id, inst2.id);
+        assert!(inst2.sequence_number > inst1.sequence_number);
+        assert_eq!(inst1.period_id, inst2.period_id);
     }
 
     #[test]
@@ -677,32 +638,6 @@ mod tests {
         assert_eq!(inst.period_id, PeriodId(1));
         assert_eq!(inst.sequence_number, SequenceNumber(1));
         assert_eq!(inst.xt_request, req);
-    }
-
-    #[test]
-    fn decide_instance_clears_active_and_validates() {
-        let (pub_inst, _, _, _) =
-            new_publisher_for_test(1, 1, 1, SuperblockHash([1; 32]), 0, default_chain_set());
-        let inst = pub_inst
-            .start_instance(make_xt_request(vec![
-                chain_req(1, &[b"a"]),
-                chain_req(2, &[b"b"]),
-            ]))
-            .unwrap();
-
-        pub_inst.decide_instance(&inst).unwrap();
-
-        // Deciding again should fail
-        let err = pub_inst.decide_instance(&inst).unwrap_err();
-        assert!(matches!(err, PublisherError::ChainNotActive));
-
-        // Starting same chains should now succeed
-        pub_inst
-            .start_instance(make_xt_request(vec![
-                chain_req(1, &[b"c"]),
-                chain_req(2, &[b"d"]),
-            ]))
-            .unwrap();
     }
 
     #[test]
