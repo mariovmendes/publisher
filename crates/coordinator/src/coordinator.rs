@@ -22,15 +22,18 @@ const MAX_PENDING_QUEUE_SIZE: usize = 100;
 #[derive(Debug)]
 pub(crate) struct ActiveXt {
     received_at: Instant,
+    start_time: Instant,
     chains: Vec<ChainId>,
     votes: HashMap<ChainId, bool>,
     instance_id_bytes: Vec<u8>,
-    start_time: Instant,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingConfirmation {
     received_at: Instant,
+    queue_time: f64,
+    decision_time: f64,
+    broadcasted_at: Instant,
     chains: Vec<ChainId>,
     confirmed_chains: HashSet<ChainId>,
     #[allow(dead_code)]
@@ -146,10 +149,10 @@ impl CoordinatorState {
             xt_id.clone(),
             ActiveXt {
                 received_at,
+                start_time: Instant::now(),
                 chains: chains.to_vec(),
                 votes: HashMap::new(),
                 instance_id_bytes: instance_id.as_bytes().to_vec(),
-                start_time: Instant::now(),
             },
         );
 
@@ -220,7 +223,10 @@ impl CoordinatorState {
         // Move tracking data before removal
         if let Some(xt) = self.active_xts.get(xt_id) {
             self.pending_confirmations.insert(xt_id.to_string(), PendingConfirmation {
-                received_at: xt.received_at,  // placeholder until received_at is added
+                received_at: xt.received_at,
+                queue_time: xt.start_time.duration_since(xt.received_at).as_secs_f64(),
+                decision_time: latency,
+                broadcasted_at: Instant::now(),
                 chains: xt.chains.clone(),
                 confirmed_chains: HashSet::new(),
                 instance_id_bytes: xt.instance_id_bytes.clone(),
@@ -242,7 +248,7 @@ impl CoordinatorState {
         Some((decision, latency, msg.encode_to_vec()))
     }
 
-    fn handle_confirmed(&mut self, xt_id: &str, chain_id: ChainId) -> Option<f64> {
+    fn handle_confirmed(&mut self, xt_id: &str, chain_id: ChainId) -> Option<(f64,f64,f64,f64)> {
         let pc = self.pending_confirmations.get_mut(xt_id)?;
 
         if !pc.chains.contains(&chain_id) {
@@ -256,8 +262,11 @@ impl CoordinatorState {
 
         if pc.confirmed_chains.len() == pc.chains.len() {
             let latency = pc.received_at.elapsed().as_secs_f64();
+            let queue_time = pc.queue_time;
+            let time_in_decision = pc.decision_time;
+            let time_to_inclusion = pc.broadcasted_at.elapsed().as_secs_f64();
             self.pending_confirmations.remove(xt_id);
-            Some(latency)
+            Some((latency,queue_time,time_in_decision,time_to_inclusion))
         } else {
             info!(xt_id, chain_id = %chain_id, "Confirmed from participant chain");
             None
@@ -667,13 +676,19 @@ impl Coordinator {
 
     pub async fn handle_confirmed(&self, instance_id: &[u8], chain_id: ChainId) {
         let xt_id = hex::encode(instance_id);
-        let latency = {
+        let times = {
             let mut state = self.state.write().await;
             state.handle_confirmed(&xt_id, chain_id)
         };
 
-        if let Some(latency) = latency {
-            info!(xt_id, latency_ms = (latency * 1000.0) as u64, "All chains confirmed block inclusion");
+        if let Some(times) = times {
+            let (latency,time_in_queue,time_in_decision,time_to_inclusion) = times;
+            info!(xt_id,
+                time_in_queue = (time_in_queue * 1000.0) as u64 ,
+                time_in_decision = (time_in_decision * 1000.0) as u64,
+                time_to_inclusion = (time_to_inclusion * 1000.0) as u64,
+                total_duration_latency_ms = (latency * 1000.0) as u64,
+                "New cTx processed:");
             if let Some(m) = &self.metrics {
                 m.xt_block_inclusion_latency_seconds.observe(latency);
             }
