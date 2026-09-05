@@ -9,6 +9,7 @@ use crate::l1_submit::L1Submitter;
 use crate::proof_types::ProofData;
 
 use compose_spec::{ChainId, PeriodId, SequenceNumber, SuperblockNumber, XtRequest};
+use crate::xtflow;
 use compose_spec_sbcp::generate_instance_id;
 use prost::Message;
 use tokio::sync::RwLock;
@@ -133,6 +134,15 @@ impl CoordinatorState {
             )),
         };
 
+        xtflow!(
+            "xt_prepared",
+            instance_id = xt_id,
+            period = period_id,
+            seq = seq_num,
+            chains = chains.len(),
+            active_xts = self.active_xts.len(),
+            max_active = MAX_ACTIVE_XTS,
+        );
         info!(
             xt_id,
             period_id = %period_id,
@@ -247,6 +257,27 @@ impl CoordinatorState {
                 .get(&xt_id)
                 .map(|xt| xt.instance_id_bytes.clone())
                 .unwrap_or_default();
+
+            if let Some(xt) = self.active_xts.get(&xt_id) {
+                let mut voted: Vec<String> = xt
+                    .votes
+                    .iter()
+                    .map(|(chain, vote)| format!("{chain}:{vote}"))
+                    .collect();
+                voted.sort();
+                xtflow!(
+                    "scp_timeout",
+                    instance_id = xt_id,
+                    age_ms = now.duration_since(xt.start_time).as_millis(),
+                    timeout_ms = timeout.as_millis(),
+                    votes = if voted.is_empty() {
+                        "-".to_string()
+                    } else {
+                        voted.join(",")
+                    },
+                    expected_votes = xt.chains.len(),
+                );
+            }
 
             self.active_xts.remove(&xt_id);
 
@@ -430,10 +461,10 @@ impl Coordinator {
         let broadcast = {
             let mut state = self.state.write().await;
 
-            if state.active_xts.len() >= MAX_ACTIVE_XTS {
+            /*if state.active_xts.len() >= MAX_ACTIVE_XTS {
                 warn!(client_id, "Active XT limit reached, rejecting new transaction");
                 return;
-            }
+            }*/
 
             Some(state.prepare_xt(&xt_req, &chains, received_at))
         };
@@ -457,6 +488,12 @@ impl Coordinator {
         vote: bool,
     ) {
         let xt_id = hex::encode(instance_id_bytes);
+        xtflow!(
+            "vote_in",
+            instance_id = xt_id,
+            chain = chain_id,
+            vote = vote,
+        );
         info!(xt_id, chain_id = %chain_id, vote, "Vote received");
 
         let result = {
@@ -465,6 +502,12 @@ impl Coordinator {
         };
 
         if let Some((decision, latency, data)) = result {
+            xtflow!(
+                "decided",
+                instance_id = xt_id,
+                decision = decision,
+                latency_ms = (latency * 1000.0) as u64,
+            );
             info!(
                 xt_id,
                 decision,
@@ -532,6 +575,7 @@ impl Coordinator {
         };
 
         for (xt_id, data) in &timed_out {
+            xtflow!("timeout_decided", instance_id = xt_id, decision = false);
             warn!(xt_id, "SCP timeout — deciding false");
             if let Some(m) = &self.metrics {
                 m.xt_decided_abort_total.inc();
