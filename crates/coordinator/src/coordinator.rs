@@ -1,6 +1,6 @@
 //! Core coordinator state and public API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use crate::l1_submit::L1Submitter;
 use crate::proof_types::ProofData;
 
 use compose_spec::{ChainId, PeriodId, SequenceNumber, SuperblockNumber, XtRequest};
+use crate::xtflow;
 use compose_spec_sbcp::generate_instance_id;
 use prost::Message;
 use tokio::sync::RwLock;
@@ -17,20 +18,24 @@ use tracing::{error, info, warn};
 use publisher_metrics::PublisherMetrics;
 use publisher_transport::server::QuicServer;
 
-const MAX_PENDING_QUEUE_SIZE: usize = 100;
+const MAX_ACTIVE_XTS: usize = 100;
 
 #[derive(Debug)]
 pub(crate) struct ActiveXt {
+    received_at: Instant,
     chains: Vec<ChainId>,
     votes: HashMap<ChainId, bool>,
     instance_id_bytes: Vec<u8>,
     start_time: Instant,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PendingEntry {
-    pub xt_request: compose_spec_proto::XtRequest,
-    pub chains: Vec<ChainId>,
+#[derive(Debug)]
+pub(crate) struct PendingConfirmation {
+    received_at: Instant,
+    chains: Vec<ChainId>,
+    confirmed_chains: HashSet<ChainId>,
+    #[allow(dead_code)]
+    instance_id_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,18 +50,18 @@ pub(crate) struct CoordinatorState {
     pub chain_to_client: HashMap<ChainId, String>,
     pub client_to_chain: HashMap<String, ChainId>,
     pub active_xts: HashMap<String, ActiveXt>,
-    pub active_chains: HashMap<ChainId, String>,
-    pub pending_queue: Vec<PendingEntry>,
     pub current_period_id: PeriodId,
     pub next_sequence_num: SequenceNumber,
     pub next_superblock_number: SuperblockNumber,
     pub last_finalized_superblock_number: u64,
     pub last_finalized_superblock_hash: Vec<u8>,
+    pub current_period_committed_xts: u64,
     /// TODO: Replace with per-superblock-number keyed collection once op-succinct
     /// sends the publisher's global superblock number instead of chain-local `end_block`.
     /// Currently collects the latest proof from each chain regardless of `superblock_number`.
     pending_proofs: HashMap<u64, ChainProof>,
     proof_collection_started: Option<Instant>,
+    pending_confirmations: HashMap<String, PendingConfirmation>,
 }
 
 impl CoordinatorState {
@@ -65,15 +70,15 @@ impl CoordinatorState {
             chain_to_client: HashMap::new(),
             client_to_chain: HashMap::new(),
             active_xts: HashMap::new(),
-            active_chains: HashMap::new(),
-            pending_queue: Vec::new(),
             current_period_id: PeriodId(0),
             next_sequence_num: SequenceNumber(1),
             next_superblock_number: SuperblockNumber::new(1),
             last_finalized_superblock_number: 0,
             last_finalized_superblock_hash: Vec::new(),
+            current_period_committed_xts: 0,
             pending_proofs: HashMap::new(),
             proof_collection_started: None,
+            pending_confirmations: HashMap::new(),
         }
     }
 
@@ -83,26 +88,6 @@ impl CoordinatorState {
         }
         self.chain_to_client.insert(chain_id, client_id.to_string());
         self.client_to_chain.insert(client_id.to_string(), chain_id);
-    }
-
-    fn has_overlap(&self, chains: &[ChainId]) -> bool {
-        chains.iter().any(|c| self.active_chains.contains_key(c))
-    }
-
-    fn reserve_chains(&mut self, xt_id: &str, chains: &[ChainId]) {
-        for &chain_id in chains {
-            self.active_chains.insert(chain_id, xt_id.to_string());
-        }
-    }
-
-    fn release_chains(&mut self, xt_id: &str) {
-        if let Some(xt) = self.active_xts.get(xt_id) {
-            for chain_id in &xt.chains {
-                if self.active_chains.get(chain_id).map(String::as_str) == Some(xt_id) {
-                    self.active_chains.remove(chain_id);
-                }
-            }
-        }
     }
 
     fn check_decision(&self, xt_id: &str) -> Option<bool> {
@@ -117,6 +102,7 @@ impl CoordinatorState {
         &mut self,
         xt_req: &compose_spec_proto::XtRequest,
         chains: &[ChainId],
+        received_at: Instant
     ) -> (String, Vec<u8>) {
         let compose_req = proto_to_spec_xt(xt_req);
         let seq_num = self.next_sequence_num;
@@ -125,10 +111,10 @@ impl CoordinatorState {
         let xt_id = instance_id.to_string();
         self.next_sequence_num = SequenceNumber(seq_num.get() + 1);
 
-        self.reserve_chains(&xt_id, chains);
         self.active_xts.insert(
             xt_id.clone(),
             ActiveXt {
+                received_at,
                 chains: chains.to_vec(),
                 votes: HashMap::new(),
                 instance_id_bytes: instance_id.as_bytes().to_vec(),
@@ -148,6 +134,15 @@ impl CoordinatorState {
             )),
         };
 
+        xtflow!(
+            "xt_prepared",
+            instance_id = xt_id,
+            period = period_id,
+            seq = seq_num,
+            chains = chains.len(),
+            active_xts = self.active_xts.len(),
+            max_active = MAX_ACTIVE_XTS,
+        );
         info!(
             xt_id,
             period_id = %period_id,
@@ -188,13 +183,26 @@ impl CoordinatorState {
 
         let decision = decision?;
 
+        if decision {
+            self.current_period_committed_xts += 1;
+        }
+
         let latency = self
             .active_xts
             .get(xt_id)
             .map(|x| x.start_time.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
-        self.release_chains(xt_id);
+        // Move tracking data before removal
+        if let Some(xt) = self.active_xts.get(xt_id) {
+            self.pending_confirmations.insert(xt_id.to_string(), PendingConfirmation {
+                received_at: xt.received_at,  // placeholder until received_at is added
+                chains: xt.chains.clone(),
+                confirmed_chains: HashSet::new(),
+                instance_id_bytes: xt.instance_id_bytes.clone(),
+            });
+        }
+
         self.active_xts.remove(xt_id);
 
         let msg = compose_spec_proto::Message {
@@ -208,6 +216,28 @@ impl CoordinatorState {
         };
 
         Some((decision, latency, msg.encode_to_vec()))
+    }
+
+    fn handle_confirmed(&mut self, xt_id: &str, chain_id: ChainId) -> Option<f64> {
+        let pc = self.pending_confirmations.get_mut(xt_id)?;
+
+        if !pc.chains.contains(&chain_id) {
+            warn!(xt_id, chain_id = %chain_id, "Confirmed from non-participant chain");
+            return None;
+        }
+
+        if !pc.confirmed_chains.insert(chain_id) {
+            return None;
+        }
+
+        if pc.confirmed_chains.len() == pc.chains.len() {
+            let latency = pc.received_at.elapsed().as_secs_f64();
+            self.pending_confirmations.remove(xt_id);
+            Some(latency)
+        } else {
+            info!(xt_id, chain_id = %chain_id, "Confirmed from participant chain");
+            None
+        }
     }
 
     /// Finds timed-out xTs and produces `Decided(false)` messages for each.
@@ -228,7 +258,27 @@ impl CoordinatorState {
                 .map(|xt| xt.instance_id_bytes.clone())
                 .unwrap_or_default();
 
-            self.release_chains(&xt_id);
+            if let Some(xt) = self.active_xts.get(&xt_id) {
+                let mut voted: Vec<String> = xt
+                    .votes
+                    .iter()
+                    .map(|(chain, vote)| format!("{chain}:{vote}"))
+                    .collect();
+                voted.sort();
+                xtflow!(
+                    "scp_timeout",
+                    instance_id = xt_id,
+                    age_ms = now.duration_since(xt.start_time).as_millis(),
+                    timeout_ms = timeout.as_millis(),
+                    votes = if voted.is_empty() {
+                        "-".to_string()
+                    } else {
+                        voted.join(",")
+                    },
+                    expected_votes = xt.chains.len(),
+                );
+            }
+
             self.active_xts.remove(&xt_id);
 
             let msg = compose_spec_proto::Message {
@@ -250,19 +300,12 @@ impl CoordinatorState {
         if let Some(started) = self.proof_collection_started {
             if Instant::now().duration_since(started) >= proof_window {
                 self.pending_proofs.clear();
+                self.current_period_committed_xts = 0;
                 self.proof_collection_started = None;
                 return true;
             }
         }
         false
-    }
-
-    fn take_next_ready(&mut self) -> Option<PendingEntry> {
-        let idx = self
-            .pending_queue
-            .iter()
-            .position(|e| !self.has_overlap(&e.chains))?;
-        Some(self.pending_queue.remove(idx))
     }
 
     fn is_chain_registered(&self, chain_id: ChainId) -> bool {
@@ -370,6 +413,10 @@ impl Coordinator {
             let pid = PeriodId(state.current_period_id.get() + 1);
             state.current_period_id = pid;
             state.next_sequence_num = SequenceNumber(1);
+            if let Some(m) = &self.metrics {
+                m.xt_finalised_per_period.set(state.current_period_committed_xts as i64);
+            }
+            state.current_period_committed_xts = 0;
             let sb = state.next_superblock_number;
             (pid, sb)
         };
@@ -409,25 +456,17 @@ impl Coordinator {
             return;
         }
 
+        let received_at = Instant::now();
+
         let broadcast = {
             let mut state = self.state.write().await;
 
-            if state.has_overlap(&chains) {
-                if state.pending_queue.len() >= MAX_PENDING_QUEUE_SIZE {
-                    warn!(client_id, "XT queue full, rejecting");
-                    return;
-                }
-                state.pending_queue.push(PendingEntry {
-                    xt_request: xt_req,
-                    chains,
-                });
-                if let Some(m) = &self.metrics {
-                    m.xt_queued_total.inc();
-                }
-                None
-            } else {
-                Some(state.prepare_xt(&xt_req, &chains))
-            }
+            /*if state.active_xts.len() >= MAX_ACTIVE_XTS {
+                warn!(client_id, "Active XT limit reached, rejecting new transaction");
+                return;
+            }*/
+
+            Some(state.prepare_xt(&xt_req, &chains, received_at))
         };
 
         if let Some((_xt_id, data)) = broadcast {
@@ -449,6 +488,12 @@ impl Coordinator {
         vote: bool,
     ) {
         let xt_id = hex::encode(instance_id_bytes);
+        xtflow!(
+            "vote_in",
+            instance_id = xt_id,
+            chain = chain_id,
+            vote = vote,
+        );
         info!(xt_id, chain_id = %chain_id, vote, "Vote received");
 
         let result = {
@@ -457,6 +502,12 @@ impl Coordinator {
         };
 
         if let Some((decision, latency, data)) = result {
+            xtflow!(
+                "decided",
+                instance_id = xt_id,
+                decision = decision,
+                latency_ms = (latency * 1000.0) as u64,
+            );
             info!(
                 xt_id,
                 decision,
@@ -476,8 +527,6 @@ impl Coordinator {
             if let Err(e) = self.server.broadcast_raw(&data, "").await {
                 error!(xt_id, error = %e, "Failed to broadcast decision");
             }
-
-            self.drain_queue().await;
         }
     }
 
@@ -519,28 +568,6 @@ impl Coordinator {
         }
     }
 
-    async fn drain_queue(&self) {
-        loop {
-            let broadcast = {
-                let mut state = self.state.write().await;
-                let Some(entry) = state.take_next_ready() else {
-                    return;
-                };
-                Some(state.prepare_xt(&entry.xt_request, &entry.chains))
-            };
-
-            if let Some((_xt_id, data)) = broadcast {
-                self.inc_broadcasts();
-                if let Some(m) = &self.metrics {
-                    m.xt_started_total.inc();
-                }
-                if let Err(e) = self.server.broadcast_raw(&data, "").await {
-                    error!(error = %e, "Failed to broadcast queued XT");
-                }
-            }
-        }
-    }
-
     pub async fn reap_timed_out_xts(&self) {
         let timed_out = {
             let mut state = self.state.write().await;
@@ -548,6 +575,7 @@ impl Coordinator {
         };
 
         for (xt_id, data) in &timed_out {
+            xtflow!("timeout_decided", instance_id = xt_id, decision = false);
             warn!(xt_id, "SCP timeout — deciding false");
             if let Some(m) = &self.metrics {
                 m.xt_decided_abort_total.inc();
@@ -556,10 +584,6 @@ impl Coordinator {
             if let Err(e) = self.server.broadcast_raw(data, "").await {
                 error!(xt_id, error = %e, "Failed to broadcast timeout decision");
             }
-        }
-
-        if !timed_out.is_empty() {
-            self.drain_queue().await;
         }
     }
 
@@ -599,6 +623,21 @@ impl Coordinator {
             self.inc_broadcasts();
             if let Err(e) = self.server.broadcast_raw(&data, "").await {
                 error!(error = %e, "Failed to broadcast rollback");
+            }
+        }
+    }
+
+    pub async fn handle_confirmed(&self, instance_id: &[u8], chain_id: ChainId) {
+        let xt_id = hex::encode(instance_id);
+        let latency = {
+            let mut state = self.state.write().await;
+            state.handle_confirmed(&xt_id, chain_id)
+        };
+
+        if let Some(latency) = latency {
+            info!(xt_id, latency_ms = (latency * 1000.0) as u64, "All chains confirmed block inclusion");
+            if let Some(m) = &self.metrics {
+                m.xt_block_inclusion_latency_seconds.observe(latency);
             }
         }
     }
@@ -704,8 +743,6 @@ impl Coordinator {
             "active_connections": self.server.connection_count().await,
             "registered_chains": state.chain_to_client.len(),
             "active_2pc_transactions": state.active_xts.len(),
-            "active_chains": state.active_chains.len(),
-            "queued_xts": state.pending_queue.len(),
             "pending_proof_superblocks": state.pending_proofs.len(),
             "current_period_id": state.current_period_id.get(),
             "next_superblock_number": state.next_superblock_number.get(),

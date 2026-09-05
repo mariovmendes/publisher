@@ -86,6 +86,14 @@ pub struct Decided {
     pub decision: bool,
 }
 
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Confirmed {
+    #[prost(bytes = "vec", tag = "1")]
+    pub instance_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub chain_id: u64,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct MailboxMessage {
     #[prost(uint64, tag = "1")]
@@ -168,7 +176,7 @@ pub struct Message {
     pub sender_id: String,
     #[prost(
         oneof = "Payload",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub payload: Option<Payload>,
 }
@@ -203,6 +211,8 @@ pub enum Payload {
     NativeDecided(NativeDecided),
     #[prost(message, tag = "15")]
     WsDecided(WsDecided),
+    #[prost(message, tag= "16")]
+    Confirmed(Confirmed)
 }
 
 #[cfg(test)]
